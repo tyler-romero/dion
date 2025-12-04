@@ -270,6 +270,14 @@ class NorMuon(Optimizer):
                             (i, p) for i, p in shard_placements if p.dim in matrix_dims
                         ]
 
+                    # We currently do not support tensors sharded along the last dimension because NorMuon
+                    # normalization later assumes a full trailing axis when computing means.
+                    if any(p.dim == params[0].ndim - 1 for _, p in shard_placements):
+                        raise NotImplementedError(
+                            "NorMuon currently does not support parameters sharded along the last dimension. "
+                            "Please avoid shards at dim -1."
+                        )
+
                     # Check that we have no more than 1 sharded matrix dimension
                     # Note that non-flattened 3D tensors can have additional sharded batch dimensions
                     # Flattened 3D tensors are limited to one sharded dimension out of all dimensions
