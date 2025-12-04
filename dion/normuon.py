@@ -20,8 +20,14 @@ from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
 # Reuse Muon's helper functions
 from .muon import (
-    muon_update_newton_schulz, muon_update_post_orthogonalize, muon_update_pre_orthogonalize, zeropower_via_newtonschulz5, adjust_lr_spectral_norm, adjust_lr_rms_norm
+    muon_update_newton_schulz,
+    muon_update_post_orthogonalize,
+    muon_update_pre_orthogonalize,
+    zeropower_via_newtonschulz5,
+    adjust_lr_spectral_norm,
+    adjust_lr_rms_norm,
 )
+
 
 class NorMuon(Optimizer):
     """
@@ -305,7 +311,9 @@ class NorMuon(Optimizer):
                 # As long as matrix dimensions are not sharded, each device will have whole matrices
                 # Each device already has different matrices of the batch, so we can't parallelize further
                 if is_batch_sharded and not is_matrix_sharded:
-                    for x, g, m, v in zip(params, gradients, momentums, variances_neuron):
+                    for x, g, m, v in zip(
+                        params, gradients, momentums, variances_neuron
+                    ):
                         yield AsyncTask(
                             muon_update_batch_async(
                                 X=[x],
@@ -495,10 +503,9 @@ def muon_update_batch_async(
         work = dist.all_to_all(
             U, single_matrix_shards, group=process_group, async_op=True
         )
-        # 
+        #
         yield
         work.wait()
-
 
     # Matrices are not sharded, so we can distribute the batch across different devices
     # Get a single matrix of the batch corresponding to this device
@@ -537,7 +544,7 @@ def muon_update_batch_async(
             flatten=flatten,
             epsilon=epsilon,
         )
-    
+
     # NorMuon normalization
     U = normuon_normalization(
         U,
@@ -567,7 +574,6 @@ def muon_update_batch_async(
     )
 
 
-
 @torch.compile(fullgraph=True)
 def normuon_normalization(
     U: List[Tensor],
@@ -581,24 +587,26 @@ def normuon_normalization(
     """
     V_dtype = V[0].dtype
     U = [u.to(dtype=V_dtype) for u in U]
-    norm_U = [u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U]  # list of ||u||_F, shape [*, 1, 1]
+    norm_U = [
+        u.norm(p=2, dim=(-2, -1), keepdim=True) for u in U
+    ]  # list of ||u||_F, shape [*, 1, 1]
 
     U_sq = torch._foreach_mul(U, U)  # list of u*u, same shapes as U
-    neuron_norms = [
-        u_sq.mean(dim=-1, keepdim=True)  # Shape: [*, 1]
-        for u_sq in U_sq
-    ]
-    torch._foreach_lerp_(V, neuron_norms, 1 - muon_beta2)  # Update variance neuron buffer
-    
-    denom = torch._foreach_sqrt(V)               # list of sqrt(v)
-    torch._foreach_add_(denom, 1e-8)             # denom[i] += 1e-8
+    neuron_norms = [u_sq.mean(dim=-1, keepdim=True) for u_sq in U_sq]  # Shape: [*, 1]
+    torch._foreach_lerp_(
+        V, neuron_norms, 1 - muon_beta2
+    )  # Update variance neuron buffer
+
+    denom = torch._foreach_sqrt(V)  # list of sqrt(v)
+    torch._foreach_add_(denom, 1e-8)  # denom[i] += 1e-8
     normalized_U = torch._foreach_div(U, denom)  # list of u / denom
 
-    norm_U_new = [nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U]  # list of ||normalized_u||_F, shape [*, 1, 1]
-    ratio = torch._foreach_div(norm_U, norm_U_new)  # list of ||u||_F / ||normalized_u||_F, shape [*, 1, 1]
-    torch._foreach_mul_(normalized_U, ratio)        # normalized_u[i] *= ratio
+    norm_U_new = [
+        nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
+    ]  # list of ||normalized_u||_F, shape [*, 1, 1]
+    ratio = torch._foreach_div(
+        norm_U, norm_U_new
+    )  # list of ||u||_F / ||normalized_u||_F, shape [*, 1, 1]
+    torch._foreach_mul_(normalized_U, ratio)  # normalized_u[i] *= ratio
 
     return normalized_U
-
-
-
