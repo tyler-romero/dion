@@ -220,7 +220,7 @@ class NorMuon(Optimizer):
                 continue
 
             # Wrap hyperparameters in tensors for torch.compile
-            muon_update_args = dict(
+            normuon_update_args = dict(
                 lr=torch.tensor(group["lr"]),
                 momentum=torch.tensor(group["mu"]),
                 muon_beta2=torch.tensor(group["muon_beta2"]),
@@ -315,25 +315,25 @@ class NorMuon(Optimizer):
                         params, gradients, momentums, variances_neuron
                     ):
                         yield AsyncTask(
-                            muon_update_batch_async(
+                            normuon_update_batch_async(
                                 X=[x],
                                 G=[g],
                                 M=[m],
                                 V=[v],
                                 shard_dim=None,  # No sharded matrix dim
-                                **muon_update_args,
+                                **normuon_update_args,
                             )
                         )
                 # Otherwise, we parallelize the Muon update across devices
                 else:
                     yield AsyncTask(
-                        muon_update_batch_async(
+                        normuon_update_batch_async(
                             X=pad_batch(params, self._world_size),
                             G=pad_batch(gradients, self._world_size),
                             M=pad_batch(momentums, self._world_size),
                             V=pad_batch(variances_neuron, self._world_size),
                             shard_dim=sharded_tensor_dim,
-                            **muon_update_args,
+                            **normuon_update_args,
                         )
                     )
 
@@ -422,7 +422,7 @@ class NorMuon(Optimizer):
             )
 
 
-def muon_update_batch_async(
+def normuon_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
