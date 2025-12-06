@@ -275,17 +275,19 @@ def parallelize_gpt_model(
         )
 
     # Apply TP
+    # Keep track of whether TP is enabled so that we set shard placement differently for FSDP
+    tp_enabled = False
     if tp_name:
         tp_mesh = device_mesh[tp_name]
         if tp_mesh.size() > 1:
             _apply_tp(model, tp_mesh)
-
-    # Apply FSDP
+            tp_enabled = True
+    # Apply FSDP (while keeping track of whether TP is enabled)
     if fs_name:
         fsdp_mesh = (
             device_mesh[fs_name] if not dp_name else device_mesh[dp_name, fs_name]
         )
-        _apply_fsdp(model, fsdp_mesh, fsdp_reshard_after_forward)
+        _apply_fsdp(model, fsdp_mesh, fsdp_reshard_after_forward, tp_enabled=tp_enabled)
 
 
 def _apply_tp(model: GPT, tp_mesh: DeviceMesh):
@@ -333,7 +335,12 @@ def _apply_tp(model: GPT, tp_mesh: DeviceMesh):
         block.attn.n_head = block.attn.n_head // tp_mesh.size()
 
 
-def _apply_fsdp(model: GPT, fsdp_mesh: DeviceMesh, reshard_after_forward: bool = True):
+def _apply_fsdp(
+    model: GPT,
+    fsdp_mesh: DeviceMesh,
+    reshard_after_forward: bool = True,
+    tp_enabled: bool = False,
+):
     # FSDP mixed precision
     mp_policy = MixedPrecisionPolicy(
         param_dtype=torch.bfloat16, reduce_dtype=torch.float32
@@ -342,35 +349,50 @@ def _apply_fsdp(model: GPT, fsdp_mesh: DeviceMesh, reshard_after_forward: bool =
     # FSDP applied bottom-up starting with individual transformer blocks
     for block in model.transformer.h:
         # Apply DP and FS as fully_shard() hybrid sharding
-        # Shard the opposite dimension as TP
-        # TP ColwiseParallel = Shard(0), so FSDP should use Shard(1)
-        # TP RowwiseParallel = Shard(1), so FSDP should use Shard(0)
-        shard_map = {
-            block.attn.c_q.weight: Shard(1),
-            block.attn.c_k.weight: Shard(1),
-            block.attn.c_v.weight: Shard(1),
-            block.attn.c_proj.weight: Shard(0),
-            block.mlp.c_fc.weight: Shard(1),
-            block.mlp.c_proj.weight: Shard(0),
-        }
+
+        # Default shard placement when TP is disabled
+        shard_placement_fn = None
+
+        # Shard placement when TP is enabled
+        if tp_enabled:
+            # Shard the opposite dimension as TP
+            # TP ColwiseParallel = Shard(0), so FSDP should use Shard(1)
+            # TP RowwiseParallel = Shard(1), so FSDP should use Shard(0)
+            shard_map = {
+                block.attn.c_q.weight: Shard(1),
+                block.attn.c_k.weight: Shard(1),
+                block.attn.c_v.weight: Shard(1),
+                block.attn.c_proj.weight: Shard(0),
+                block.mlp.c_fc.weight: Shard(1),
+                block.mlp.c_proj.weight: Shard(0),
+            }
+            shard_placement_fn = lambda param: shard_map.get(param)
+
         fully_shard(
             block,
             mesh=fsdp_mesh,
-            shard_placement_fn=lambda param: shard_map.get(param),
+            shard_placement_fn=shard_placement_fn,
             mp_policy=mp_policy,
             reshard_after_forward=reshard_after_forward,
         )
 
     # Apply DP and FS to embedding and lm_head
     # Don't reshard after forward since backward happens immediately afterwards
-    shard_map = {
-        model.transformer.wte.weight: Shard(1),
-        model.lm_head.weight: Shard(1),
-    }
+
+    # Default shard placement when TP is disabled
+    shard_placement_fn = None
+
+    # Shard placement when TP is enabled
+    if tp_enabled:
+        shard_map = {
+            model.transformer.wte.weight: Shard(1),
+            model.lm_head.weight: Shard(1),
+        }
+        shard_placement_fn = lambda param: shard_map.get(param)
     fully_shard(
         model,
         mesh=fsdp_mesh,
         mp_policy=mp_policy,
-        shard_placement_fn=lambda param: shard_map.get(param),
+        shard_placement_fn=shard_placement_fn,
         reshard_after_forward=False,
     )
