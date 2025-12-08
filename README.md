@@ -1,9 +1,11 @@
-# Dion: Distributed Orthonormal Updates
+# Welcome to the Microsoft/Dion Codebase
 
-This repository provides efficient implementations of Dion and Muon optimizers for distributed ML training.
- 
-* See our paper for more information on Dion: https://arxiv.org/pdf/2504.05295.
-* See the original blog post on Muon: https://kellerjordan.github.io/posts/muon/
+This repository provides efficient implementations of orthonormal optimizers for distributed ML training.
+You can find the following optimizers:
+* [Muon](https://kellerjordan.github.io/posts/muon/)
+* [Dion](https://arxiv.org/pdf/2504.05295)
+* Dion2
+* [NorMuon](https://arxiv.org/abs/2510.05491) 
 
 ## Table of Contents
 <details>
@@ -36,12 +38,12 @@ This repository provides efficient implementations of Dion and Muon optimizers f
 
 ## Requirements
 
-This code is written for modern PyTorch (version 2.7 or newer) using DTensor-based parallelism. This includes FSDP2 with `fully_shard`and tensor parallelism (TP) with `parallelize_module`. Support for other distributed training APIs is not guaranteed.
+This code is written for modern PyTorch (version 2.7 or newer) using DTensor-based parallelism. This includes FSDP2 with `fully_shard` and tensor parallelism (TP) with `parallelize_module`. Support for other distributed training APIs is not implemented.
 
 
 ## Quick Start
 
-Dion and Muon optimizers are available as a `pip` package! Install to use in your project:
+Our implementations are available as a `pip` package! Install to use in your project:
 
 ```bash
 pip install git+https://github.com/microsoft/dion.git
@@ -50,10 +52,10 @@ pip install git+https://github.com/microsoft/dion.git
 Then in your code, you can use:
 
 ```python
-from dion import Dion, Muon
+from dion import Dion, Dion2, Muon, NorMuon
 ```
 
-Please carefully go through this readme for detailed instructions on using our optimizers. There are major differences compared to PyTorch built-in optimizers, like `Adam`/`AdamW`.
+Please carefully go through this readme for detailed instructions on using our optimizers. There are major differences compared to PyTorch built-in optimizers, such as `Adam`/`AdamW`.
 
 ### Running Our Sample Training Script
 
@@ -71,7 +73,7 @@ python data/cached_fineweb10B.py 30
 
 ### Distributed Data Parallel (DDP) Training
 
-To train a GPT-small model using Dion with 8 GPUs (adjust as needed for your setup):
+To train a GPT-small model using Dion2 with 8 GPUs (adjust as needed for your setup):
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml
 ```
@@ -82,7 +84,7 @@ This will launch Distributed Data Parallel (DDP) training.
 To enable more advanced distributed strategies such as Fully Sharded Data Parallel (FSDP) and Tensor Parallelism (TP), you can specify the configuration in the `dion_160m.yaml` file: 
 
 ```yaml
-# — Distributed training —
+# Example of sharding configuration
 dp_size: 2      # data‐parallel size
 fs_size: 2      # FSDP size
 tp_size: 2      # tensor‐parallel size
@@ -90,47 +92,58 @@ tp_size: 2      # tensor‐parallel size
 
 This example sets up a hybrid configuration with DDP × FSDP × TP = 2 × 2 × 2.
 
-Alternatively, you can override these values directly from the command line. All three values must be explicitly given, but a size may be set to `1` to omit a parallelism dimension.
+Alternatively, you can override these values directly from the command line:
 
 ```bash
 torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml \
   --dp_size 2 --fs_size 2 --tp_size 2
 ```
 
-####  Example Weights & Biases (wandb) Plots
+All three values must be explicitly given, but a size may be set to `1` to omit a parallelism dimension. For instance, for FSDP over 8 devices, you can either configure from `.yaml` as:
 
-With the appropriate configuration, you should be able to reproduce the results shown in the [validation curves for GPT-small](https://microsoft-research.wandb.io/t-gmagakyan/dion-exp/reports/Validation-curves-for-GPT-small--VmlldzoxNjk5OA?accessToken=52e6z4d18yfkewz1bawlkmwc2m91al9ssa7rpwvnx1f1xa66j15lr7x315wj2kys).
+```yaml
+# Example of pure FSDP configuration
+dp_size: 1      # data‐parallel size
+fs_size: 8      # FSDP size
+tp_size: 1      # tensor‐parallel size
+```
 
 
 ## Introduction
 
-Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been Adam/AdamW. However, recent work has shown that **orthonormalized matrix updates** can significantly accelerate model convergence. See [Bernstein and Newhouse, 2025](https://openreview.net/forum?id=hErdffTsLu) for a theoretical justification.
+Optimization algorithms are essential to training neural networks, converting gradients into model weight updates to minimize loss. For many years, the state-of-the-art method has been [Adam](https://arxiv.org/abs/1412.6980)/[AdamW](https://arxiv.org/abs/1711.05101). However, recent work has shown that **orthonormal matrix optimizers** can significantly accelerate model convergence. Check out blog posts by [Jeremy Bernstein](https://jeremybernste.in/writing/deriving-muon) and [Laker Newhouse](https://www.lakernewhouse.com/writing/muon-1) for more details.
 
 The practical effectiveness of orthonormal updates was first demonstrated by [Muon](https://kellerjordan.github.io/posts/muon/) in the [NanoGPT speedrun](https://github.com/KellerJordan/modded-nanogpt), and has since been validated at scale by models such as [Kimi K2](https://arxiv.org/abs/2507.20534) and [GLM-4.5](https://z.ai/blog/glm-4.5). Muon implements orthonormalization via *Newton-Schulz iterations*, which relies on repeated matrix-matrix multiplications. However, large-scale training relies on model sharding, where weight matrices and optimizer states are distributed across multiple processes. As discussed by [Essential AI](https://www.essential.ai/blog/infra), orthonormalizing a sharded matrix with Newton-Schulz iterations involves the communication-intensive procedure of reconstructing the full matrices from their individual shards.
 
-**Dion** is our approach for a more **scalable and communication-efficient** optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The difference is that Dion uses an alternative orthonormalization method based on amortized power iteration (in the style of [PowerSGD](https://arxiv.org/pdf/1905.13727)), which can be applied directly on sharded matrices. Furthermore, Dion introduces a *rank fraction* hyperparameter, allowing for compute and communication reduction via low-rank compression. To mitigate information loss, Dion adds an error feedback mechanism that captures the difference between the original matrix and its low-rank approximation.
+**Dion/Dion2** are our methods for building a **scalable, communication-efficient** optimizer. Like Muon, it computes orthonormal weight updates and has the same benefits of faster model convergence. The key difference is that Dion/Dion2 **shrink the matrix before orthonormalization**. Dion uses power iteration to compute a low-rank approximation, while Dion2 applies a simple submatrix-selection procedure. To reduce information loss, both methods include an error-feedback mechanism that tracks the discrepancy between the original matrix and its compressed approximation.
 
 
 ## Optimizers
 
 Our main implementations of Dion (`dion.py`) and Muon (`muon.py`) support the following parallelization techniques:
 
-| Parallelization    | Dion | Muon |
-|--------------------|------|------|
-| Single device      | Yes  | Yes  |
-| PyTorch DDP        | Yes  | Yes  |
-| PyTorch FSDP2      | Yes  | Yes  |
-| PyTorch FSDP2 + TP | Yes  | No   |
+| Parallelization    | Dion | Dion2 | Muon | NorMuon |
+|--------------------|------|-------|------|---------| 
+| Single device      | Yes  |  Yes  | Yes  |   Yes   |
+| PyTorch DDP        | Yes  |  Yes  | Yes  |   Yes   |
+| PyTorch FSDP2      | Yes  |  Yes  | Yes  |   Yes   |
+| PyTorch FSDP2 + TP | Yes  |  No   | No   |   No    |
 
 For faster performance, both of these optimizers will process parameters in batches and interleave multiple batches to overlap compute with communication.
 
-We include Dion, Muon, and several alternative implementations of the optimizers in the `optimizers/` directory of this repo.
+We include optimizer implementations in the `dion/` directory of this repo.
  
 * `dion.py`: High-performance version of Dion. Depending on how each batch of matrices is sharded, we select the best communication patterns to compute Dion's orthonormal update. All-reduce operations may be split into reduce-scatter and all-gather across the batch dimension to more efficiently distribute work and avoid redundant computation.
 * `muon.py`: High-performance version of Muon. For sharded matrices, all-to-all communication is used to simultaneously unshard and distribute a batch of matrices. For replicated matrices, Muon will distribute work across all devices and all-gather final results.
+* `dion2.py`: A preliminary implementation of Dion2, which uses a similar all-to-all communication pattern to distribute orthonormalization. Only an $\alpha$-fraction of the momentum matrix is orthonormalized, leaving room for additional communication optimizations.
+* `normuon.py`: A variant of the Muon optimizer that introduces neuron-wise normalization to improve stability and convergence efficiency, modified to take similar arguments as `muon.py`. See [the paper](https://arxiv.org/abs/2510.05491) for more details.
+
+We also provide some reference implementations:
+
 * `dion_reference.py`: An implementation without batching, communication overlapping, or split all-reduce. This version of Dion is intended to closely follow the algorithms as described in our [Dion paper](https://arxiv.org/pdf/2504.05295).
 * `dion_simple.py`: A simplified illustration of the Dion update rule in a single Python function, provided for educational value.
 * `muon_reference.py`: A version of Muon by [Moonshot AI](https://github.com/MoonshotAI/Moonlight), modified to take similar arguments as `muon.py`.
+
 
 
 ## Building Parameter Groups
