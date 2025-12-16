@@ -30,7 +30,7 @@ from dion import DionSimple
 from dion import Muon
 from dion import MuonReference
 from dion import Dion2
-from dion import Dion2 as Dion2Old
+from dion import Dion2Old
 from dion import NorMuon
 
 
@@ -445,6 +445,32 @@ def init_optimizer(
         print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
         print0(f"Distributed Dion2 using: {comm_method}")
         opt = Dion2(
+            param_groups,
+            distributed_mesh=distributed_mesh,
+            lr=hp.lr,
+            fraction=hp.rank_fraction,
+            ef_decay=hp.mu,
+            weight_decay=hp.weight_decay,
+            adjust_lr=hp.adjust_lr,
+            use_triton=(not cli_args.no_triton),
+        )
+    elif hp.optimizer == "dion2old":
+        if device_mesh is not None:
+            # Ensure that we have a supported device mesh configuration for dion2
+            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
+                raise ValueError("Tensor parallel is not supported by dion2.")
+            distributed_mesh = (
+                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
+            )
+            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
+        else:
+            assert ddp_model is not None
+            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
+            comm_method = "all-gather"
+        print0(f"LR adjust method: {hp.adjust_lr}")
+        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
+        print0(f"Distributed Dion2Old using: {comm_method}")
+        opt = Dion2Old(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,

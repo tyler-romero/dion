@@ -29,17 +29,17 @@ wandb_job_name: null
 no_wandb: false
 
 # — Distributed training —
-dp_size: 1      # data‐parallel size
-fs_size: 4      # FSDP size
-tp_size: 1    # DO NOT USE TP for Dion2
+dp_size: null      # data‐parallel size
+fs_size: null      # FSDP size
+tp_size: null    # DO NOT USE TP for Dion2
 
 # — Miscellaneous flags —
 debug: false
 no_compile: false
 no_triton: false
 
-optimizer: dion2
-rank_fraction: 0.125 
+optimizer: dion2old
+rank_fraction: 0.5
 scalar_opt: lion
 adjust_lr: spectral_norm
 lr: 0.02
