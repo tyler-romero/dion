@@ -1,24 +1,3 @@
-"""
-Dion2 Optimizer - Fully Optimized Implementation
-
-Key differences from Muon:
-- Selects top-α fraction of rows (by L2 norm) for orthogonalization
-- Only communicates and orthogonalizes the selected submatrix
-- Applies error-feedback decay to selected rows after extraction
-
-Communication pattern (same as Muon):
-- DDP: all-gather (each rank orthogonalizes one matrix, then gathers results)
-- FSDP: all-to-all (shards → full matrix on owner → orthogonalize → shards)
-
-Row selection is done locally on each shard, so:
-- DDP: selection on full matrix
-- FSDP: selection on each shard independently (slightly different algorithm, similar performance)
-
-Optimizations:
-- torch.compile on hot paths for kernel fusion and reduced Python overhead
-- foreach operations for batched tensor updates
-- Stacked tensor operations for row selection (all matrices in batch have same shape)
-"""
 
 import math
 import torch
@@ -40,6 +19,12 @@ from .opt_utils import (
 )
 from .scalar_opts import adamw_update_foreach_async, lion_update_foreach_async
 
+# Reuse Muon's helper functions
+from .muon import (
+    muon_update_newton_schulz,
+    adjust_lr_spectral_norm,
+    adjust_lr_rms_norm,
+)
 
 class Dion2(Optimizer):
     """
@@ -49,17 +34,27 @@ class Dion2(Optimizer):
         params: Parameters for the optimizer.
         distributed_mesh: DeviceMesh or ProcessGroup for distributed training.
             Use DeviceMesh for FSDP2 and ProcessGroup for DistributedDataParallel.
-        lr: Base learning rate. Scaled based on matrix dimensions.
-        fraction: Fraction of rows to orthogonalize per update (0 < fraction <= 1).
-        ef_decay: Error-feedback decay factor applied to selected rows.
+        lr: Base learning rate. For Muon, this will be scaled based on the matrix dimensions.
+            For element-wise update rules, this is the actual learning rate and no additional scaling is done.
+        fraction: Fraction of submatrix to orthogonalize per update (0 < fraction <= 1).
+        ef_decay: Error-feedback decay factor applied to selected submatrix.
         betas: Tuple of (beta1, beta2) for AdamW and Lion algorithms.
-        weight_decay: Weight decay factor.
-        epsilon: Small value to avoid division by zero.
-        adjust_lr: How to adjust learning rate ("spectral_norm", "rms_norm", or None).
-        flatten: Whether to flatten 3D+ tensors to 2D.
-        use_triton: Whether to use Triton kernel for Newton-Schulz.
-        newton_schulz_func: Custom Newton-Schulz function.
-    """
+        weight_decay: Weight decay factor. 
+        epsilon: Small value to avoid division by zero. 
+        adjust_lr: How to adjust the learning rate for Muon updates ("spectral_norm" or "rms_norm" or None).
+            "spectral_norm": Adjust based on spectral norm, for learning rate transfer across model scale.
+            "rms_norm": Adjust based on RMS norm, for learning rate compatibility with Adam/AdamW.
+            None: Do not adjust the learning rate.
+        flatten: Whether to flatten 3D+ tensors to 2D for Muon updates.
+            True: Tensors with 3+ dimensions are flattened to 2D. Use this for convolutional layers.
+            False: Tensors are not flattened. 3D+ tensors are treated as batches of 2D matrices.
+        use_triton: Whether to use Triton kernel for Newton-Schulz. Ignored if custom function is provided.
+        newton_schulz_func: Use a custom Newton-Schulz function for orthogonalization.
+            Signature is `func(input: Tensor, epsilon: float) -> Tensor`.
+        verbose: Whether to print debug information during updates. This prints whether rows or columns are selected for submatrix selection process.
+
+    Dion2 optimizer by Ahn et al.: TBD
+    """ 
 
     def __init__(
         self,
@@ -75,6 +70,7 @@ class Dion2(Optimizer):
         flatten: bool = False,
         use_triton: bool = False,
         newton_schulz_func: Optional[Callable] = None,
+        verbose: bool = False,
     ):
         # Validate hyperparameters
         if lr < 0.0:
@@ -133,7 +129,7 @@ class Dion2(Optimizer):
             self._newton_schulz_func = newton_schulz_triton
         else:
             self._newton_schulz_func = zeropower_via_newtonschulz5
-
+        self.verbose = verbose
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -157,7 +153,7 @@ class Dion2(Optimizer):
             else:
                 raise ValueError(f"Unknown algorithm: {algo}")
 
-        dion2_tasks = self._create_dion2_tasks(dion2_groups)
+        dion2_tasks = self._create_dion2_tasks(dion2_groups, verbose=self.verbose)
         lion_tasks = self._create_lion_tasks(lion_groups)
         adamw_tasks = self._create_adamw_tasks(adamw_groups)
 
@@ -177,7 +173,7 @@ class Dion2(Optimizer):
         return state
 
     def _create_dion2_tasks(
-        self, param_groups: List[dict]
+        self, param_groups: List[dict], verbose: bool = False,
     ) -> Generator["AsyncTask", None, None]:
         """Create batched Dion2 update tasks."""
         for group in param_groups:
@@ -260,6 +256,7 @@ class Dion2(Optimizer):
                                 M=[m],
                                 shard_dim=None,
                                 **dion2_args,
+                                verbose=verbose,
                             )
                         )
                 else:
@@ -270,6 +267,7 @@ class Dion2(Optimizer):
                             M=pad_batch(momentums, self._world_size),
                             shard_dim=shard_dim,
                             **dion2_args,
+                            verbose=verbose,
                         )
                     )
 
@@ -332,6 +330,7 @@ class Dion2(Optimizer):
             )
 
 
+
 # =============================================================================
 # Core Dion2 Update Functions
 # =============================================================================
@@ -352,38 +351,81 @@ def dion2_update_batch_async(
     shard_dim: Optional[int] = None,
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
+    verbose: bool = False,
 ) -> Generator[None, None, None]:
     """
-    Batched Dion2 update with fractional row selection.
+    Batched Dion2 update with fractional submatrix selection.
     
     Algorithm:
     1. Update momentum: M = M + G
-    2. Select top-α rows by L2 norm, extract submatrix
-    3. Apply ef_decay to selected rows in M
+    2. Select top-α fraction along select_dim by L2 norm, extract submatrix
+    3. Apply ef_decay to selected slices in M
     4. Communicate and orthogonalize only the submatrix
-    5. Apply weight update to corresponding rows
+    5. Apply weight update to corresponding slices
+    
+    Selection dimension (select_dim):
+    - FSDP row-sharded (shard_dim=-2): select rows (select_dim=-2), row norms are local
+    - FSDP col-sharded (shard_dim=-1): select cols (select_dim=-1), col norms are local  
+    - DDP/Single GPU: select rows by default (select_dim=-2)
     
     Communication patterns:
     - FSDP (shard_dim is not None): 
-        - Parameters are row-sharded across ranks
-        - Each rank selects top-k rows from its local shard
-        - All-to-all gathers selected rows to form full submatrix
+        - All-to-all gathers selected slices to form full submatrix
         - Orthogonalize, then all-to-all scatter back
     - DDP (shard_dim is None, world_size > 1):
-        - Each rank has full matrices (batch of different matrices)
         - Each rank orthogonalizes one matrix from the batch
         - All-gather to distribute results
     - Single GPU: direct computation
     """
     assert len(X) == len(G) == len(M)
 
-    # Step 1: Update momentum and select top-α rows (operates on local shards)
+    # Determine selection dimension based on sharding
+    # 
+    # shard_dim from DTensor can be:
+    #   - Absolute index (0, 1, 2, ...) 
+    #   - Negative index (-2, -1)
+    #   - None (not sharded)
+    #
+    # We need to map this to select_dim which is always -2 (rows) or -1 (cols)
+    # relative to the last two dimensions (the matrix dimensions).
+    #
+    # For FSDP: select along the sharded dimension so norms are local
+    # For DDP/Single-GPU: select along the SHORTER dimension to reduce Newton-Schulz compute
+    
+    ndim = X[0].ndim
+    
+    if shard_dim is not None:
+        # Convert shard_dim to normalized form relative to tensor
+        normalized_shard_dim = shard_dim if shard_dim < 0 else shard_dim - ndim
+        
+        # Check if shard_dim corresponds to a matrix dimension (last two dims)
+        if normalized_shard_dim == -2:
+            # Row-sharded: select rows, compute row norms (norm over cols)
+            select_dim = -2
+        elif normalized_shard_dim == -1:
+            # Col-sharded: select cols, compute col norms (norm over rows)
+            select_dim = -1
+        else:
+            # Batch dimension sharded: not a matrix dim, fall back to shorter dim
+            num_rows, num_cols = X[0].shape[-2:]
+            select_dim = -2 if num_rows <= num_cols else -1
+    else:
+        # DDP/Single-GPU: choose shorter dimension to reduce Newton-Schulz compute
+        num_rows, num_cols = X[0].shape[-2:]
+        select_dim = -2 if num_rows <= num_cols else -1
+
+    # Debug: Print selection choice (only on first call per parameter shape)
+    if verbose:
+        _print_selection_choice(X[0].shape, shard_dim, select_dim, ndim)
+
+    # Step 1: Update momentum and select top-α fraction along select_dim
     # All matrices in batch have identical shapes, enabling stacked operations
-    U_selected, row_indices_list = dion2_pre_orthogonalize(
+    U_selected, indices_list = dion2_pre_orthogonalize(
         G=to_local(G),
         M=to_local(M),
         fraction=fraction,
         ef_decay=ef_decay,
+        select_dim=select_dim,
     )
 
     # Step 2: Communicate and orthogonalize selected submatrices
@@ -400,18 +442,19 @@ def dion2_update_batch_async(
         yield
         work.wait()
 
-        # Concatenate along row dimension to form full selected submatrix
-        full_submatrix = torch.cat(recv_shards, dim=-2)
+        # Concatenate along selection dimension to form full selected submatrix
+        # select_dim matches shard_dim, so we concatenate along that dimension
+        full_submatrix = torch.cat(recv_shards, dim=select_dim)
 
         # Orthogonalize the full selected submatrix
-        full_submatrix = dion2_newton_schulz(
+        full_submatrix = muon_update_newton_schulz(
             full_submatrix, newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
 
-        # Split back into shards
+        # Split back into shards along the same dimension
         send_shards = [
             t.contiguous()
-            for t in torch.tensor_split(full_submatrix, world_size, dim=-2)
+            for t in torch.tensor_split(full_submatrix, world_size, dim=select_dim)
         ]
 
         # All-to-all: scatter orthogonalized shards back to original owners
@@ -428,7 +471,7 @@ def dion2_update_batch_async(
         assert process_group is not None
 
         # This rank orthogonalizes the matrix at index device_rank
-        my_submatrix = dion2_newton_schulz(
+        my_submatrix = muon_update_newton_schulz(
             U_selected[device_rank], newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
 
@@ -446,7 +489,7 @@ def dion2_update_batch_async(
     else:
         assert len(U_selected) == 1
         U_ortho = [
-            dion2_newton_schulz(
+            muon_update_newton_schulz(
                 U_selected[0], newton_schulz_func, flatten=flatten, epsilon=epsilon
             )
         ]
@@ -455,20 +498,21 @@ def dion2_update_batch_async(
     if adjust_lr is None:
         adjusted_lr = lr
     elif adjust_lr == "spectral_norm":
-        adjusted_lr = _adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
+        adjusted_lr = adjust_lr_spectral_norm(lr, X[0].shape, flatten=flatten)
     elif adjust_lr == "rms_norm":
-        adjusted_lr = _adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
+        adjusted_lr = adjust_lr_rms_norm(lr, X[0].shape, flatten=flatten)
     else:
         raise ValueError(f"Unknown adjust_lr: {adjust_lr}")
 
-    # Step 4: Apply weight update to selected rows only
+    # Step 4: Apply weight update to selected slices only
     dion2_post_orthogonalize(
         X=to_local(X),
         U_ortho=U_ortho,
-        row_indices=row_indices_list,
+        indices=indices_list,
         base_lr=lr,
         adjusted_lr=adjusted_lr,
         weight_decay=weight_decay,
+        select_dim=select_dim,
     )
 
 
@@ -479,6 +523,17 @@ def dion2_update_batch_async(
 # KEY INSIGHT: All matrices in a batch have identical shapes!
 # This enables stacked/batched tensor operations instead of loops.
 #
+# SELECTION DIMENSION:
+# - select_dim=-2 (rows): Compute row norms (norm over cols), select top-k rows
+# - select_dim=-1 (cols): Compute col norms (norm over rows), select top-k cols
+#
+# For FSDP, select_dim matches shard_dim so norms are computed locally.
+# For DDP/Single-GPU, select_dim is the shorter dimension to reduce compute.
+#
+# NORM CHOICE: L1 norm (sum of absolute values)
+# - Cheaper than L2: no squaring or sqrt needed
+# - Effective proxy for selecting high-magnitude rows/cols
+#
 # OPTIMIZATION 1: Stack into 3D tensor for batched ops
 # ----------------------------------------------------
 # Stack (N, rows, cols) enables:
@@ -486,17 +541,7 @@ def dion2_update_batch_async(
 #   - Single batched topk instead of N separate topk calls  
 #   - Single batched gather instead of N separate index_selects
 #
-# Why faster:
-#   - One kernel launch instead of N launches
-#   - Better GPU parallelism
-#   - Reduced Python loop overhead
-#
-# OPTIMIZATION 2: In-place ef_decay via loop (unavoidable)
-# --------------------------------------------------------
-# torch.stack creates a copy, so we must apply ef_decay to originals.
-# However, the loop benefits from torch.compile fusion.
-#
-# OPTIMIZATION 3: foreach for gradient accumulation
+# OPTIMIZATION 2: foreach for gradient accumulation
 # -------------------------------------------------
 # Optimal for in-place batched additions.
 # =============================================================================
@@ -505,61 +550,85 @@ def dion2_update_batch_async(
 def dion2_pre_orthogonalize(
     G: List[Tensor],
     M: List[Tensor],
-    fraction: float,
+    fraction: Tensor,
     ef_decay: Tensor,
+    select_dim: int,
 ) -> Tuple[List[Tensor], List[Tensor]]:
     """
-    Update momentum and select top-α rows for orthogonalization.
+    Update momentum and select top-α fraction along select_dim.
     
     All matrices in the batch have identical shapes, enabling stacked operations.
     
+    Args:
+        G: List of gradients
+        M: List of momentum buffers (modified in place)
+        fraction: Fraction of rows/cols to select
+        ef_decay: Decay factor for selected slices
+        select_dim: Dimension to select along (-2 for rows, -1 for cols)
+    
     For each matrix M (shape: rows x cols):
     1. M += G (accumulate gradient into momentum)
-    2. Compute L2 norm of each row
-    3. Select top-k rows where k = ceil(fraction * rows)
-    4. Extract selected rows as submatrix (k x cols)
-    5. Apply ef_decay to selected rows in M (in-place)
+    2. Compute L1 norm along the OTHER dimension
+       - select_dim=-2: norm over cols (dim=-1) → row norms
+       - select_dim=-1: norm over rows (dim=-2) → col norms
+    3. Select top-k indices where k = ceil(fraction * size_of_select_dim)
+    4. Extract selected slices as submatrix
+    5. Apply ef_decay to selected slices in M (in-place)
     
     Returns:
         U_selected: List of selected submatrices in bf16 for communication
-        row_indices: List of selected row indices for each matrix
+        indices_list: List of selected indices for each matrix
     """
     dtype = M[0].dtype
-    num_rows = M[0].size(-2)
-    num_cols = M[0].size(-1)
-    k = max(1, int(math.ceil(fraction * num_rows)))
+    
+    # Determine sizes and norm dimension
+    # norm_dim is the dimension we compute norm OVER (the other dimension)
+    # select_dim is the dimension we SELECT from
+    num_select = M[0].size(select_dim)
+    norm_dim = -1 if select_dim == -2 else -2
+    k = max(1, int(math.ceil(fraction * num_select)))
     
     # OPTIMIZATION 1: foreach for batched gradient accumulation
-    # Single fused kernel for all M += G operations
     G_casted = [g.to(dtype=dtype) for g in G]
     torch._foreach_add_(M, G_casted)
     
     # OPTIMIZATION 2: Stack for batched norm and topk
-    # Shape: (batch_size, num_rows, num_cols)
+    # Shape: (batch_size, rows, cols)
     M_stacked = torch.stack(M, dim=0)
     
-    # Batched L2 norm: (batch_size, num_rows)
-    row_norms = M_stacked.norm(dim=-1)
+    # Compute L1 norm along norm_dim (sum of absolute values)
+    # - If select_dim=-2 (rows): norm over dim=-1 → shape (batch, rows)
+    # - If select_dim=-1 (cols): norm over dim=-2 → shape (batch, cols)
+    slice_norms = M_stacked.norm(p=1, dim=norm_dim)
     
     # Batched topk: indices shape (batch_size, k)
-    _, indices = torch.topk(row_norms, k, dim=-1, sorted=False)
+    _, indices = torch.topk(slice_norms, k, dim=-1, sorted=False)
     
-    # OPTIMIZATION 3: Batched gather for row extraction
-    # (batch_size, k, num_cols)
-    indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
-    selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
+    # OPTIMIZATION 3: Batched gather for slice extraction
+    if select_dim == -2:
+        # Selecting rows: expand indices to (..., k, cols)
+        num_cols = M[0].size(-1)
+        indices_expanded = indices.unsqueeze(-1).expand(-1, -1, num_cols)
+        selected_stacked = torch.gather(M_stacked, dim=-2, index=indices_expanded)
+    else:
+        # Selecting cols: expand indices to (..., rows, k)
+        num_rows = M[0].size(-2)
+        indices_expanded = indices.unsqueeze(-2).expand(-1, num_rows, -1)
+        selected_stacked = torch.gather(M_stacked, dim=-1, index=indices_expanded)
     
-    # Apply ef_decay to selected rows in original M tensors
+    # Apply ef_decay to selected slices in original M tensors
     # Must loop because M tensors are separate (stack created a copy)
-    # torch.compile will still optimize this loop
-    row_indices_list = list(indices.unbind(dim=0))
-    for m, idx in zip(M, row_indices_list):
-        m[idx, :] *= ef_decay
+    # Use index_copy_ with proper dimension handling for arbitrary batch dims
+    indices_list = list(indices.unbind(dim=0))
+    for m, idx in zip(M, indices_list):
+        # Extract, scale, and copy back using the correct dimension
+        selected_slice = m.index_select(dim=select_dim, index=idx)
+        m.index_copy_(dim=select_dim, index=idx, source=selected_slice * ef_decay)
     
     # Convert to bf16 and unstack for communication
     U_selected = list(selected_stacked.to(dtype=torch.bfloat16).unbind(dim=0))
     
-    return U_selected, row_indices_list
+    return U_selected, indices_list
 
 
 # =============================================================================
@@ -576,27 +645,33 @@ def dion2_pre_orthogonalize(
 #
 # OPTIMIZATION 3: Loop with index_add_ (torch.compile optimized)
 # --------------------------------------------------------------
-# While we can't use foreach for indexed updates, torch.compile
-# will fuse operations within each iteration and optimize the loop.
-#
-# Note: Stacking X would require copy-back which negates benefits.
-# The loop approach is cleaner and torch.compile handles it well.
+# torch.compile fuses operations within each iteration.
 # =============================================================================
 
 @torch.compile(fullgraph=True)
 def dion2_post_orthogonalize(
     X: List[Tensor],
     U_ortho: List[Tensor],
-    row_indices: List[Tensor],
+    indices: List[Tensor],
     base_lr: Tensor,
     adjusted_lr: Tensor,
     weight_decay: Tensor,
+    select_dim: int,
 ):
     """
-    Apply weight decay (to all rows) and update selected rows only.
+    Apply weight decay (to all elements) and update selected slices only.
     
-    Weight decay: X = X * (1 - base_lr * weight_decay)  [all rows]
-    Update: X[selected_rows] -= adjusted_lr * U_ortho   [selected rows only]
+    Args:
+        X: List of parameters to update
+        U_ortho: List of orthogonalized update submatrices
+        indices: List of selected indices for each matrix
+        base_lr: Base learning rate (for weight decay)
+        adjusted_lr: Adjusted learning rate (for updates)
+        weight_decay: Weight decay factor
+        select_dim: Dimension that was selected (-2 for rows, -1 for cols)
+    
+    Weight decay: X = X * (1 - base_lr * weight_decay)  [all elements]
+    Update: X[selected_slices] -= adjusted_lr * U_ortho [selected slices only]
     """
     # OPTIMIZATION 1: foreach for batched weight decay
     torch._foreach_mul_(X, 1 - base_lr * weight_decay)
@@ -606,55 +681,59 @@ def dion2_post_orthogonalize(
     U_converted = [u.to(dtype=dtype) for u in U_ortho]
     
     # OPTIMIZATION 3: Precompute scaled updates
-    # This allows torch.compile to potentially fuse with index_add_
     neg_lr = -adjusted_lr
     U_scaled = [neg_lr * u for u in U_converted]
     
-    # Apply updates to selected rows
+    # Apply updates to selected slices
     # torch.compile optimizes this loop
-    for x, u_scaled, indices in zip(X, U_scaled, row_indices):
-        x.index_add_(dim=-2, index=indices, source=u_scaled)
+    for x, u_scaled, idx in zip(X, U_scaled, indices):
+        x.index_add_(dim=select_dim, index=idx, source=u_scaled)
+
+ 
+
+ 
+
+
 
 
 # =============================================================================
-# Newton-Schulz Wrapper (unchanged)
+# Debug Helper: Print Selection Choice (once per configuration)
 # =============================================================================
 
-def dion2_newton_schulz(
-    X: Tensor,
-    newton_schulz_func: Callable,
-    flatten: bool,
-    epsilon: Tensor,
-) -> Tensor:
-    """Apply Newton-Schulz orthogonalization with optional flattening."""
-    original_shape = X.shape
-    if flatten and X.ndim >= 3:
-        X = X.flatten(start_dim=1)
-    elif X.ndim >= 4:
-        X = X.flatten(end_dim=-3)
+_printed_configs: set = set()
 
-    return newton_schulz_func(X, epsilon=epsilon).reshape(original_shape)
-
-
-# =============================================================================
-# Learning Rate Adjustment Functions (unchanged)
-# =============================================================================
-
-def _adjust_lr_spectral_norm(lr: Tensor, param_shape: torch.Size, flatten: bool) -> Tensor:
-    """Adjust LR based on spectral norm (for scale transfer)."""
-    if flatten:
-        fan_out = param_shape[0]
-        fan_in = math.prod(param_shape[1:])
-    else:
-        fan_out, fan_in = param_shape[-2:]
-    return lr * math.sqrt(fan_out / fan_in)
-
-
-def _adjust_lr_rms_norm(lr: Tensor, param_shape: torch.Size, flatten: bool) -> Tensor:
-    """Adjust LR based on RMS norm (for Adam/AdamW compatibility)."""
-    if flatten:
-        fan_out = param_shape[0]
-        fan_in = math.prod(param_shape[1:])
-    else:
-        fan_out, fan_in = param_shape[-2:]
-    return lr * 0.2 * math.sqrt(max(fan_out, fan_in))
+def _print_selection_choice(
+    shape: torch.Size, 
+    shard_dim: Optional[int], 
+    select_dim: int,
+    ndim: int,
+):
+    """Print the selection dimension choice once per unique configuration."""
+    config_key = (tuple(shape), shard_dim, select_dim)
+    if config_key not in _printed_configs:
+        _printed_configs.add(config_key)
+        
+        num_rows, num_cols = shape[-2:]
+        select_info = "rows" if select_dim == -2 else "columns"
+        norm_info = "row norms" if select_dim == -2 else "col norms"
+        
+        if shard_dim is None:
+            mode = "DDP/Single-GPU"
+            shorter = "rows" if num_rows <= num_cols else "cols"
+            reason = f"shorter dim = {shorter} ({min(num_rows, num_cols)})"
+        else:
+            # Normalize shard_dim for display
+            normalized = shard_dim if shard_dim < 0 else shard_dim - ndim
+            if normalized == -2:
+                mode = "FSDP"
+                reason = f"row-sharded (shard_dim={shard_dim}→-2)"
+            elif normalized == -1:
+                mode = "FSDP"
+                reason = f"col-sharded (shard_dim={shard_dim}→-1)"
+            else:
+                mode = "FSDP batch-sharded"
+                shorter = "rows" if num_rows <= num_cols else "cols"
+                reason = f"shard_dim={shard_dim} (batch), shorter = {shorter}"
+        
+        print(f"[Dion2] Shape {tuple(shape)}: {mode}, {reason} → "
+              f"select top-α {select_info} by {norm_info}")

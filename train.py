@@ -76,7 +76,7 @@ class Hyperparameters:
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
-
+    verbose: bool = False
 
 # Helper function to only print on global rank 0
 MASTER_PROCESS = True
@@ -453,6 +453,7 @@ def init_optimizer(
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
+            verbose=hp.verbose,
         )
     elif hp.optimizer == "dion2old":
         if device_mesh is not None:
