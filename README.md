@@ -3,9 +3,9 @@
 This repository provides efficient implementations of orthonormal optimizers for distributed ML training.
 You can find the following optimizers:
 * [Muon](https://kellerjordan.github.io/posts/muon/)
-* [Dion](https://arxiv.org/pdf/2504.05295)
-* Dion2
+* Dion2 and [Dion](https://arxiv.org/pdf/2504.05295) Dion is a legacy optimizer; we recommend using Dion2)
 * [NorMuon](https://arxiv.org/abs/2510.05491) 
+
 
 ## Table of Contents
 <details>
@@ -52,7 +52,7 @@ pip install git+https://github.com/microsoft/dion.git
 Then in your code, you can use:
 
 ```python
-from dion import Dion, Dion2, Muon, NorMuon
+from dion import Dion2, Muon, NorMuon, Dion
 ```
 
 Please carefully go through this readme for detailed instructions on using our optimizers. There are major differences compared to PyTorch built-in optimizers, such as `Adam`/`AdamW`.
@@ -73,40 +73,60 @@ python data/cached_fineweb10B.py 30
 
 ### Distributed Data Parallel (DDP) Training
 
-To train a GPT-small model using Dion2 with 8 GPUs (adjust as needed for your setup):
+To train a GPT-small model using Dion2 with 4 GPUs (adjust as needed for your setup):
 ```bash
-torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml
+torchrun --standalone --nproc_per_node=4 train.py --config configs/dion2_160m.yaml
 ```
 This will launch Distributed Data Parallel (DDP) training.
 
-### Advanced FSDP / TP / Hybrid Sharded Training
+### Distributed Training: FSDP / TP / Hybrid Sharding
 
-To enable more advanced distributed strategies such as Fully Sharded Data Parallel (FSDP) and Tensor Parallelism (TP), you can specify the configuration in the `dion_160m.yaml` file: 
+#### Fully Sharded Data Parallel (FSDP)
 
-```yaml
-# Example of sharding configuration
-dp_size: 2      # data‐parallel size
-fs_size: 2      # FSDP size
-tp_size: 2      # tensor‐parallel size
-```
-
-This example sets up a hybrid configuration with DDP × FSDP × TP = 2 × 2 × 2.
-
-Alternatively, you can override these values directly from the command line:
-
+To enable FSDP, specify the FSDP group size using `--fs_size`:
 ```bash
-torchrun --standalone --nproc_per_node=8 train.py --config configs/dion_160m.yaml \
-  --dp_size 2 --fs_size 2 --tp_size 2
+torchrun --standalone --nproc_per_node=4 train.py \
+  --config configs/dion2_160m.yaml \
+  --fs_size 4
 ```
 
-All three values must be explicitly given, but a size may be set to `1` to omit a parallelism dimension. For instance, for FSDP over 8 devices, you can either configure from `.yaml` as:
+This configuration trains a GPT-small model using Dion2 with FSDP sharding across all 4 GPUs (a single FSDP group of size 4).
 
-```yaml
-# Example of pure FSDP configuration
-dp_size: 1      # data‐parallel size
-fs_size: 8      # FSDP size
-tp_size: 1      # tensor‐parallel size
+#### Hybrid Sharded Data Parallel (HSDP)
+
+To use Hybrid Sharded Data Parallel, where multiple FSDP groups are replicated using Data Parallel (DP), set `--fs_size` smaller than the total number of GPUs and specify the data parallel dimension via `--dp_size`:
+```bash
+torchrun --standalone --nproc_per_node=4 train.py \
+  --config configs/dion2_160m.yaml \
+  --fs_size 2 \
+  --dp_size 2
 ```
+
+This configuration creates:
+- **2 FSDP groups**, each spanning 2 GPUs
+- **2-way data parallelism** across the FSDP groups
+- **Total**: 4 GPUs with 2-way FSDP × 2-way DP
+
+#### Tensor Parallelism (TP)
+
+**Note**: Currently, only Dion (our legacy implementation) supports Tensor Parallelism.
+
+You can combine all three parallelism strategies (DP × FSDP × TP). For example, a 2 × 2 × 2 configuration across 8 GPUs:
+```bash
+torchrun --standalone --nproc_per_node=8 train.py \
+  --config configs/dion_160m.yaml \
+  --dp_size 2 \
+  --fs_size 2 \
+  --tp_size 2
+```
+
+This configuration creates:
+- **2-way data parallelism** (outer replication)
+- **2-way FSDP**  
+- **2-way tensor parallelism**  
+- **Total**: 8 GPUs with 2-way DP × 2-way FSDP × 2-way TP
+
+**General rule**: The product `dp_size × fs_size × tp_size` must equal `nproc_per_node`. Any unspecified dimension defaults to 1.
 
 
 ## Introduction

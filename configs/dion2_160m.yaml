@@ -6,7 +6,7 @@ n_head: 6
 sequence_length: 1024
 
 # — Batching & Training —
-batch_size: 1024
+batch_size: 128
 device_batch_size: 32
 num_iterations: 3000
 
@@ -30,8 +30,7 @@ no_triton: false
 
 # — Distributed training —
 dp_size: null      # data‐parallel size
-fs_size: null      # FSDP size
-tp_size: null      # DO NOT USE TP for Dion2
+fs_size: null      # FSDP size 
 
 # — Optimizer & Hyperparameters —
 optimizer: dion2
