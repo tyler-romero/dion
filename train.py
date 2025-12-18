@@ -1,5 +1,3 @@
-# train.py below
-
 import argparse
 import math
 import os
@@ -30,7 +28,6 @@ from dion import DionSimple
 from dion import Muon
 from dion import MuonReference
 from dion import Dion2
-from dion import Dion2Old
 from dion import NorMuon
 
 
@@ -67,7 +64,7 @@ class Hyperparameters:
     lr: float = 0.02
     mu: float = 0.95
     weight_decay: float = 0.01
-    rank_fraction: float = 0.125 
+    ortho_fraction: float = 0.25
 
     # Optimizer specific hyperparameters
     qr_method: str = "rcqr"
@@ -131,12 +128,6 @@ def parse_cli_args():
         type=str,
         default=None,
         help="Adjust learning rate method for Muon",
-    )
-    parser.add_argument(
-        "--inv_rank_fraction",
-        type=int,
-        default=None,
-        help="1/r rank fraction for Dion",
     )
     parser.add_argument(
         "--qr_method", type=str, default=None, choices=["qr", "cqr", "rcqr"]
@@ -365,7 +356,7 @@ def init_optimizer(
         dion_mixed_precision_config = None
 
     if hp.optimizer == "dion":
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion rank fraction: {hp.ortho_fraction}")
         print0(f"Dion mixed precision: {hp.mixed_precision}")
         print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
         opt = Dion(
@@ -374,7 +365,7 @@ def init_optimizer(
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
             replicate_mesh_grad_sync=hp.replicate_mesh_grad_sync,
-            rank_fraction=hp.rank_fraction,
+            rank_fraction=hp.ortho_fraction,
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
@@ -385,7 +376,7 @@ def init_optimizer(
         )
 
     elif hp.optimizer == "dion_reference":
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion rank fraction: {hp.ortho_fraction}")
         print0(f"Dion QR method: {hp.qr_method}")
         print0(f"Dion mixed precision: {hp.mixed_precision}")
         print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
@@ -395,7 +386,7 @@ def init_optimizer(
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
             replicate_mesh_grad_sync=hp.replicate_mesh_grad_sync,
-            rank_fraction=hp.rank_fraction,
+            rank_fraction=hp.ortho_fraction,
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
@@ -433,9 +424,9 @@ def init_optimizer(
         )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
-            # Ensure that we have a supported device mesh configuration for dion2
+            # Ensure that we have a supported device mesh configuration for Dion2
             if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
-                raise ValueError("Tensor parallel is not supported by dion2.")
+                raise ValueError("Tensor parallel is not supported by Dion2.")
             distributed_mesh = (
                 outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
             )
@@ -451,38 +442,12 @@ def init_optimizer(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
-            fraction=hp.rank_fraction,
-            ef_decay=hp.mu,
-            weight_decay=hp.weight_decay, 
-            adjust_lr=hp.adjust_lr,
-            use_triton=(not cli_args.no_triton),
-            verbose=hp.verbose,
-        )
-    elif hp.optimizer == "dion2old":
-        if device_mesh is not None:
-            # Ensure that we have a supported device mesh configuration for dion2
-            if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
-                raise ValueError("Tensor parallel is not supported by dion2.")
-            distributed_mesh = (
-                outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
-            )
-            comm_method = "all-to-all" if outer_shard_mesh.size() > 1 else "all-gather"
-        else:
-            assert ddp_model is not None
-            distributed_mesh = ddp_model.process_group  # using ProcessGroup for DDP
-            comm_method = "all-gather"
-        print0(f"LR adjust method: {hp.adjust_lr}")
-        print0(f"Triton Newton-Schulz kernels: {not cli_args.no_triton}")
-        print0(f"Distributed Dion2Old using: {comm_method}")
-        opt = Dion2Old(
-            param_groups,
-            distributed_mesh=distributed_mesh,
-            lr=hp.lr,
-            fraction=hp.rank_fraction,
+            fraction=hp.ortho_fraction,
             ef_decay=hp.mu,
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
+            verbose=hp.verbose,
         )
     elif hp.optimizer == "normuon":
         if device_mesh is not None:
@@ -514,13 +479,13 @@ def init_optimizer(
 
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion rank fraction: {hp.ortho_fraction}")
         opt = DionSimple(
             param_groups,
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            rank=round(hp.rank_fraction * hp.model_dim),
+            rank=round(hp.ortho_fraction * hp.model_dim),
             mixed_precision_config=dion_mixed_precision_config,
         )
 
@@ -674,9 +639,6 @@ def main():
     cli_args = parse_cli_args()
     hp = Hyperparameters()
     hp = override_args_from_cli(hp, cli_args)
-
-    if cli_args.inv_rank_fraction:
-        hp.rank_fraction = 1.0 / cli_args.inv_rank_fraction
 
     if hp.checkpoint_freq > 0:
         if not hp.checkpoint_dir:
@@ -848,7 +810,7 @@ def main():
     # Create a name to identify this run
     run_name = f"({hp.optimizer}+{hp.scalar_opt})"
     if "dion" in hp.optimizer or "dion2" in hp.optimizer:
-        run_name += f"frac={hp.rank_fraction}"
+        run_name += f"frac={hp.ortho_fraction}"
     if cli_args.dp_size is not None:
         run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"
     if cli_args.wandb_job_name:
