@@ -270,9 +270,9 @@ optimizer = Dion2(                     # or Muon or NorMuon
 ```
   
 
-### Flattened Meshes
+#### Flattened Meshes
 
-When more advanced parallelism strategies are used (such as context parallel or expert parallel), it is common for multiple mesh dimensions to be "flattened" into a 1D sub-mesh for sharding. In this scenario, the flattened mesh needs to be given to Dion.
+When more advanced parallelism strategies are used (such as context parallel or expert parallel), it is common for multiple mesh dimensions to be "flattened" into a 1D sub-mesh for sharding. In this scenario, the flattened mesh needs to be given to the optimizer.
 
 ```python
 mesh = init_device_mesh(
@@ -285,29 +285,21 @@ mesh = init_device_mesh(
 fs_mesh = mesh["dp", "cp"]._flatten()
 fully_shard(model, mesh=fs_mesh)
 
-optimizer = Dion(
+optimizer = Dion2(                  # or Muon or NorMuon
     param_groups,
-    replicate_mesh = None,          # No replicated data parallel used
-    outer_shard_mesh = fs_mesh,     # Sharded data parallel across flattened mesh
-    inner_shard_mesh = mesh["tp"],  # Tensor parallel
+    distributed_mesh = fs_mesh,     # Sharded data parallel across flattened mesh 
     ...
 )
 ```
 
-### Usage with DDP ProcessGroup
+#### Usage with DDP ProcessGroup
 
 Training with DistributedDataParallel (DDP) is also supported. DDP uses PyTorch `ProcessGroup` instead of `DeviceMesh`, which is stored in the DDP-wrapped model's `process_group` field. Providing this to the optimizer will allow it to efficiently distribute work across all GPUs. If no `process_group` is provided, the optimizer will run in single-GPU mode, and every device in the DDP world will redundantly perform the same work.
 
 ```python
 ddp_model = DistributedDataParallel(model, ...)
 
-optimizer = Dion(
-    param_groups,
-    replicated_mesh=ddp_model.process_group,
-    ...
-)
-# - or -
-optimizer = Muon(
+optimizer = Dion2(                              # or Muon or NorMuon
     param_groups,
     distributed_mesh=ddp_model.process_group,
     ...
