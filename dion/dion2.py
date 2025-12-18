@@ -400,16 +400,16 @@ def dion2_update_batch_async(
     X: List[Tensor],  # Model weights (modified in place)
     G: List[Tensor],  # Gradient
     M: List[Tensor],  # Momentum buffer (modified in place)
-    lr: Tensor,     # Learning rate (scalar tensor)
-    ef_decay: Tensor,   # Error-feedback factor (scalar tensor)
-    fraction: float,    # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
-    weight_decay: Tensor, # Weight decay (scalar tensor)
-    epsilon: Tensor, # Epsilon (scalar tensor)
+    lr: Tensor,  # Learning rate (scalar tensor)
+    ef_decay: Tensor,  # Error-feedback factor (scalar tensor)
+    fraction: float,  # Fraction of submatrix to orthogonalize (0 < fraction <= 1)
+    weight_decay: Tensor,  # Weight decay (scalar tensor)
+    epsilon: Tensor,  # Epsilon (scalar tensor)
     flatten: bool,  # Whether to flatten 3D+ tensors to 2D
-    adjust_lr: Optional[str],   # How to adjust learning rate
-    device_rank: int,   # Rank of the current device
-    world_size: int,    # Total number of devices to parallelize over
-    shard_dim: Optional[int] = None,    # Shard dimension for DTensor (if applicable)
+    adjust_lr: Optional[str],  # How to adjust learning rate
+    device_rank: int,  # Rank of the current device
+    world_size: int,  # Total number of devices to parallelize over
+    shard_dim: Optional[int] = None,  # Shard dimension for DTensor (if applicable)
     process_group: Optional[ProcessGroup] = None,
     newton_schulz_func: Optional[Callable] = None,
     verbose: bool = False,
@@ -420,7 +420,7 @@ def dion2_update_batch_async(
     Identical hyperparameters are used for all tensors in the batch.
     """
     assert len(X) == len(G)
-    assert len(X) == len(M) 
+    assert len(X) == len(M)
 
     # Determine selection dimension based on sharding and tensor shape:
     # For sharded matrices, we align select_dim with shard_dim
@@ -462,12 +462,12 @@ def dion2_update_batch_async(
         assert (
             process_group is not None
         ), "process_group must be provided for sharded DTensors"
-        assert isinstance(X[0], DTensor), "X should contain DTensors" 
+        assert isinstance(X[0], DTensor), "X should contain DTensors"
         assert (
             X[0].size(shard_dim) % world_size == 0
         ), f"Shard dimension {shard_dim} size {X[0].size(shard_dim)} is not divisible by world size {world_size}."
 
-        # Allocate buffers to receive shards of one whole submatrix from other devices 
+        # Allocate buffers to receive shards of one whole submatrix from other devices
         recv_shards = [torch.empty_like(u) for u in U_selected]
         work = dist.all_to_all(
             recv_shards, U_selected, group=process_group, async_op=True
@@ -477,7 +477,7 @@ def dion2_update_batch_async(
 
         # Concatentate shards to form a whole matrix to orthogonalize
         # Only submatrix is orthogonalized!
-        full_submatrix = torch.cat(recv_shards, dim=select_dim) 
+        full_submatrix = torch.cat(recv_shards, dim=select_dim)
         full_submatrix = muon_update_newton_schulz(
             full_submatrix, newton_schulz_func, flatten=flatten, epsilon=epsilon
         )
@@ -503,7 +503,7 @@ def dion2_update_batch_async(
 
         single_matrix = U_selected[device_rank]
         assert not isinstance(single_matrix, DTensor)
- 
+
         single_ortho = muon_update_newton_schulz(
             single_matrix,
             newton_schulz_func,
@@ -647,6 +647,7 @@ def dion2_post_orthogonalize(
 # A helper function to print selection chocie for each matrix
 # It only prints once `verbose` is set True
 _printed_configs: set = set()
+
 
 def _print_selection_choice(
     shape: torch.Size,

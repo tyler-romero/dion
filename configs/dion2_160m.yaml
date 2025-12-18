@@ -6,7 +6,7 @@ n_head: 6
 sequence_length: 1024
 
 # — Batching & Training —
-batch_size: 128
+batch_size: 1024
 device_batch_size: 32
 num_iterations: 3000
 

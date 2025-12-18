@@ -267,12 +267,11 @@ def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
         print0(f"World size: {world_size}")
 
     else:
-        # Use device mesh for distributed training 
+        # Use device mesh for distributed training
         # Fill None values with 1
         dp_size = dp_size if dp_size is not None else 1
         fs_size = fs_size if fs_size is not None else 1
         tp_size = tp_size if tp_size is not None else 1
-
 
         # Check if we have the right number of GPUs
         total_gpus = dp_size * fs_size * tp_size
@@ -812,9 +811,9 @@ def main():
     optimizer_name = hp.optimizer
     if "dion" in hp.optimizer or "dion2" in hp.optimizer:
         optimizer_name = f"{hp.ortho_fraction}-{hp.optimizer}"
-    
+
     run_name = f"({optimizer_name}+{hp.scalar_opt})"
-    
+
     if device_mesh is not None:
         dp, fs, tp = device_mesh.size(0), device_mesh.size(1), device_mesh.size(2)
         run_name += f"_(dp={dp}, fs={fs}, tp={tp})"
