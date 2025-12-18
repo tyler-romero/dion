@@ -237,34 +237,38 @@ param_groups = [
 ]
 ```
 
-
 ## Distributed Training Configuration
 
 For our efficient distributed optimizers to work correctly, they need information about the model's parallelization scheme. This is provided by passing `DeviceMesh` objects during optimizer construction.
-We demonstrate this for Dion first, since it has the most comprehensive parallelism support in our current implementation.  
 
-### Device Mesh for Dion
+### 1D Sharding Configuration (Dion2, Muon, NorMuon)
 
-Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The sharded meshes are referred to as `outer_shard_mesh` and `inner_shard_mesh`. Dion's internal optimizer states can be sharded over both meshes. During the update computation, Dion will orthonormalize a low-rank matrix that is replicated across `outer_shard_mesh`, but always remains sharded across `inner_shard_mesh`. Thus, the `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
+Most optimizers in this codebase (Dion2, Muon, NorMuon) currently support only 1D sharding. They accept a single 1D device mesh via the `distributed_mesh` argument and adapt their behavior based on how this mesh is used:
 
-Unused meshes may be omitted or given as `None`. If only one sharding dimension is used (e.g. only FSDP without TP), we recommend providing it as the `outer_shard_mesh`. Dion will execute a faster single-device orthonormalization routine in this case, since the input matrix to be orthonormalized will not be sharded.
-
+- **If the mesh is used for parameter sharding**: The optimizer efficiently unshards parameters using all-to-all communication
+- **If the mesh is not used for sharding**: The optimizer distributes work across devices and all-gathers the final results
+ 
+For a hybrid sharded data parallel (HSDP) configuration with both replicated and sharded dimensions, pass only the sharded sub-mesh to the optimizer:
 ```python
-# Example with a 3D mesh
 mesh = init_device_mesh(
     device_type="cuda",
-    mesh_shape=(dp_size, fs_size, tp_size),
-    mesh_dim_names=("dp", "fs", "tp")
+    mesh_shape=(replicate_size, shard_size),
+    mesh_dim_names=("replicate", "shard"),
 )
 
-optimizer = Dion(
+# Apply HSDP with 2D device mesh
+# Parameters are sharded across the 1st dim and replicated across the 0th dim
+# https://docs.pytorch.org/docs/stable/distributed.fsdp.fully_shard.html
+fully_shard(model, mesh=mesh)
+
+# Pass only the sharded dimension to the optimizer
+optimizer = Dion2(                     # or Muon or NorMuon
     param_groups,
-    replicate_mesh = mesh["dp"],    # Replicated data parallel
-    outer_shard_mesh = mesh["fs"],  # Sharded data parallel
-    inner_shard_mesh = mesh["tp"],  # Tensor parallel
+    distributed_mesh=mesh["shard"],    # 1D sub-mesh (sharded dimension only)
     ...
 )
 ```
+  
 
 ### Flattened Meshes
 
@@ -273,8 +277,8 @@ When more advanced parallelism strategies are used (such as context parallel or 
 ```python
 mesh = init_device_mesh(
     device_type="cuda",
-    mesh_shape=(dp_size, cp_size, tp_size),
-    mesh_dim_names=("dp", "cp", "tp")
+    mesh_shape=(dp_size, cp_size),
+    mesh_dim_names=("dp", "cp")
 )
 
 # FSDP sharding applied across combined DP and CP meshes
@@ -286,31 +290,6 @@ optimizer = Dion(
     replicate_mesh = None,          # No replicated data parallel used
     outer_shard_mesh = fs_mesh,     # Sharded data parallel across flattened mesh
     inner_shard_mesh = mesh["tp"],  # Tensor parallel
-    ...
-)
-```
-
-### Device Mesh for Dion2, Muon and Others
-
-Muon uses different device mesh arguments from Dion.
-
-Our implementation of Muon takes a single 1D device mesh as a generic `distributed_mesh` argument. If this mesh is used for sharding parameters, Muon will efficiently perform unsharding using all-to-all. If this mesh is not used for sharding, Muon will distribute work across this mesh and all-gather the final results.
-
-2D sharding is not supported by Muon---use Dion instead. For hybrid-sharded data parallel, with a replicated mesh dimension and a sharded dimension, pass only the sharded sub-mesh to Muon.
-
-```python
-mesh = init_device_mesh(
-    device_type="cuda",
-    mesh_shape=(replicate_size, shard_size),
-    mesh_dim_names=("replicate", "shard"),
-)
-
-# Hybrid sharded data parallel with 2D device mesh
-fully_shard(model, mesh=mesh)
-
-optimizer = Muon(
-    param_groups,
-    distributed_mesh = mesh["shard"],  # 1D sub-mesh
     ...
 )
 ```
@@ -331,6 +310,32 @@ optimizer = Dion(
 optimizer = Muon(
     param_groups,
     distributed_mesh=ddp_model.process_group,
+    ...
+)
+```
+
+
+
+### Device Mesh for Dion
+
+We demonstrate this for Dion first, since it has the most comprehensive parallelism support in our current implementation.  
+Dion supports up to two sharded mesh dimensions and any number of data-parallel replicated mesh dimensions. The sharded meshes are referred to as `outer_shard_mesh` and `inner_shard_mesh`. Dion's internal optimizer states can be sharded over both meshes. During the update computation, Dion will orthonormalize a low-rank matrix that is replicated across `outer_shard_mesh`, but always remains sharded across `inner_shard_mesh`. Thus, the `inner_shard_mesh` is more communication-intensive and works best with intra-node tensor parallelism. Both sharding meshes must be one-dimensional.
+
+Unused meshes may be omitted or given as `None`. If only one sharding dimension is used (e.g. only FSDP without TP), we recommend providing it as the `outer_shard_mesh`. Dion will execute a faster single-device orthonormalization routine in this case, since the input matrix to be orthonormalized will not be sharded.
+
+```python
+# Example with a 3D mesh
+mesh = init_device_mesh(
+    device_type="cuda",
+    mesh_shape=(dp_size, fs_size, tp_size),
+    mesh_dim_names=("dp", "fs", "tp")
+)
+
+optimizer = Dion(
+    param_groups,
+    replicate_mesh = mesh["dp"],    # Replicated data parallel
+    outer_shard_mesh = mesh["fs"],  # Sharded data parallel
+    inner_shard_mesh = mesh["tp"],  # Tensor parallel
     ...
 )
 ```
