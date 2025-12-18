@@ -426,7 +426,7 @@ for data in dataloader:
     model.zero_grad()
 ```
 
-#### Checkpointing under Compressed-DP Sync
+### Checkpointing
 
 Dion when `replicate_mesh_grad_sync = True` requires synchronizing optimizer state before saving a checkpoint. This is because of Dion's decoupled momentum, where internal optimizer states will be different across the replicate mesh. Call the `synchronize_for_checkpoint()` function to explicitly perform an all-reduce of optimizer states. This ensures the consistency of distributed checkpoints, since typically each state will only be saved by one process along the replicated data-parallel mesh. This function will be a no-op if `replicate_mesh_grad_sync=False` or no replicate mesh is used.
 
