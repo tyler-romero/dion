@@ -64,7 +64,7 @@ class Hyperparameters:
     lr: float = 0.02
     mu: float = 0.95
     weight_decay: float = 0.01
-    rank_fraction: float = 0.125
+    ortho_fraction: float = 0.25
 
     # Optimizer specific hyperparameters
     qr_method: str = "rcqr"
@@ -73,6 +73,9 @@ class Hyperparameters:
     replicate_mesh_grad_sync: bool = False
     mixed_precision: bool = False
     adjust_lr: str = "spectral_norm"  # for Muon only
+
+    # For printing out selection choice in Dion2
+    verbose: bool = True
 
 
 # Helper function to only print on global rank 0
@@ -125,12 +128,6 @@ def parse_cli_args():
         type=str,
         default=None,
         help="Adjust learning rate method for Muon",
-    )
-    parser.add_argument(
-        "--inv_rank_fraction",
-        type=int,
-        default=None,
-        help="1/r rank fraction for Dion",
     )
     parser.add_argument(
         "--qr_method", type=str, default=None, choices=["qr", "cqr", "rcqr"]
@@ -271,10 +268,10 @@ def init_distributed(dp_size, fs_size, tp_size) -> Optional[DeviceMesh]:
 
     else:
         # Use device mesh for distributed training
-        # All mesh dimensions must be specified
-        assert all(
-            d is not None for d in mesh_dims
-        ), f"All mesh dimensions (dp_size, fs_size, tp_size) must be specified, but got ({dp_size}, {fs_size}, {tp_size})"
+        # Fill None values with 1
+        dp_size = dp_size if dp_size is not None else 1
+        fs_size = fs_size if fs_size is not None else 1
+        tp_size = tp_size if tp_size is not None else 1
 
         # Check if we have the right number of GPUs
         total_gpus = dp_size * fs_size * tp_size
@@ -359,7 +356,7 @@ def init_optimizer(
         dion_mixed_precision_config = None
 
     if hp.optimizer == "dion":
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion rank fraction: {hp.ortho_fraction}")
         print0(f"Dion mixed precision: {hp.mixed_precision}")
         print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
         opt = Dion(
@@ -368,7 +365,7 @@ def init_optimizer(
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
             replicate_mesh_grad_sync=hp.replicate_mesh_grad_sync,
-            rank_fraction=hp.rank_fraction,
+            rank_fraction=hp.ortho_fraction,
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
@@ -379,7 +376,7 @@ def init_optimizer(
         )
 
     elif hp.optimizer == "dion_reference":
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion rank fraction: {hp.ortho_fraction}")
         print0(f"Dion QR method: {hp.qr_method}")
         print0(f"Dion mixed precision: {hp.mixed_precision}")
         print0(f"Compressed data-parallel gradient sync: {hp.replicate_mesh_grad_sync}")
@@ -389,7 +386,7 @@ def init_optimizer(
             outer_shard_mesh=outer_shard_mesh,
             inner_shard_mesh=inner_shard_mesh,
             replicate_mesh_grad_sync=hp.replicate_mesh_grad_sync,
-            rank_fraction=hp.rank_fraction,
+            rank_fraction=hp.ortho_fraction,
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
@@ -427,9 +424,9 @@ def init_optimizer(
         )
     elif hp.optimizer == "dion2":
         if device_mesh is not None:
-            # Ensure that we have a supported device mesh configuration for dion2
+            # Ensure that we have a supported device mesh configuration for Dion2
             if inner_shard_mesh is not None and inner_shard_mesh.size() > 1:
-                raise ValueError("Tensor parallel is not supported by dion2.")
+                raise ValueError("Tensor parallel is not supported by Dion2.")
             distributed_mesh = (
                 outer_shard_mesh if outer_shard_mesh.size() > 1 else replicate_mesh
             )
@@ -445,11 +442,12 @@ def init_optimizer(
             param_groups,
             distributed_mesh=distributed_mesh,
             lr=hp.lr,
-            fraction=hp.rank_fraction,
+            fraction=hp.ortho_fraction,
             ef_decay=hp.mu,
             weight_decay=hp.weight_decay,
             adjust_lr=hp.adjust_lr,
             use_triton=(not cli_args.no_triton),
+            verbose=hp.verbose,
         )
     elif hp.optimizer == "normuon":
         if device_mesh is not None:
@@ -481,13 +479,13 @@ def init_optimizer(
 
     elif hp.optimizer == "dion_simple":
         assert device_mesh is None, f"{hp.optimizer} does not support device mesh"
-        print0(f"Dion rank fraction: {hp.rank_fraction}")
+        print0(f"Dion rank fraction: {hp.ortho_fraction}")
         opt = DionSimple(
             param_groups,
             lr=hp.lr,
             mu=hp.mu,
             weight_decay=hp.weight_decay,
-            rank=round(hp.rank_fraction * hp.model_dim),
+            rank=round(hp.ortho_fraction * hp.model_dim),
             mixed_precision_config=dion_mixed_precision_config,
         )
 
@@ -641,9 +639,6 @@ def main():
     cli_args = parse_cli_args()
     hp = Hyperparameters()
     hp = override_args_from_cli(hp, cli_args)
-
-    if cli_args.inv_rank_fraction:
-        hp.rank_fraction = 1.0 / cli_args.inv_rank_fraction
 
     if hp.checkpoint_freq > 0:
         if not hp.checkpoint_dir:
@@ -813,11 +808,15 @@ def main():
     # --- Logging initialization ---
     # Load hyperparameters and update with CLI arguments
     # Create a name to identify this run
-    run_name = f"({hp.optimizer}+{hp.scalar_opt})"
+    optimizer_name = hp.optimizer
     if "dion" in hp.optimizer or "dion2" in hp.optimizer:
-        run_name += f"frac={hp.rank_fraction}"
-    if cli_args.dp_size is not None:
-        run_name += f"_dp={cli_args.dp_size}_fs={cli_args.fs_size}_tp={cli_args.tp_size}_gradsync={cli_args.replicate_mesh_grad_sync}"
+        optimizer_name = f"{hp.ortho_fraction}-{hp.optimizer}"
+
+    run_name = f"({optimizer_name}+{hp.scalar_opt})"
+
+    if device_mesh is not None:
+        dp, fs, tp = device_mesh.size(0), device_mesh.size(1), device_mesh.size(2)
+        run_name += f"_(dp={dp}, fs={fs}, tp={tp})"
     if cli_args.wandb_job_name:
         run_name += f"_{cli_args.wandb_job_name}"
 
