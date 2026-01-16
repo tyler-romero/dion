@@ -607,9 +607,10 @@ def normuon_normalization(
         nu.norm(p=2, dim=(-2, -1), keepdim=True) for nu in normalized_U
     ]  # list of ||normalized_u||_F, shape [*, 1, 1]
     
-    # Protect against division by zero when norm_U_new is zero
-    # This can happen when U is all zeros (e.g., zero gradients from zero-initialized weights)
-    # In this case, ratio should be 1 (or 0, since U is already zero)
+    # Protect against division by zero when norm_U_new is zero.
+    # This can happen when U is all zeros (e.g., zero gradients from zero-initialized weights).
+    # In this case, norm_U is also zero, so after clamping norm_U_new to ε the ratio becomes 0/ε ≈ 0,
+    # and normalized_U * ratio correctly remains zero, preserving the zero state.
     norm_U_new_safe = [nu.clamp(min=1e-8) for nu in norm_U_new]
     
     ratio = torch._foreach_div(
